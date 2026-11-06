@@ -1,0 +1,18 @@
+HomeTask 14.4 — Add 5% Customer Service Fee
+
+IMPORTANT: Back up your entire HomeTask project first, especially hometask.sqlite3.
+This patch is based on the recovered HomeTask 14.3 sources and uses the original 14.3 design.
+
+1. Stop your local server (Control+C in Terminal).
+2. Copy the four main files from this patch into your existing HomeTask directory:
+   server.py, app.js, styles.css, index.html
+3. DO NOT replace or delete your existing hometask.sqlite3 or brand/ folder.
+4. Restart from your project directory:
+   python3 -m uvicorn server:app --host 0.0.0.0 --port 8000
+5. Open http://127.0.0.1:8000 and hard refresh with Command+Shift+R.
+
+New task bookings will display a 5% customer service fee in addition to the agreed task price. The backend creates an additive schema migration; old payment records retain their previous customer total and zero fee.
+
+With no Stripe test credentials, bookings are explicitly unfunded demos. Stripe TEST checkout uses test cards only. Live payments, real payouts and Stripe Connect are NOT enabled.
+
+The archive deliberately excludes brand files, database files, passwords and other private data.
