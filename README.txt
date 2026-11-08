@@ -17,6 +17,9 @@ Deploy
 2. In Render, choose New > Blueprint and connect the repository.
 3. Review render.yaml and apply the blueprint. Render installs the Python
    dependencies and starts the FastAPI app with the command in that file.
+   If you created the service manually or set a custom Start Command in the
+   Render dashboard, use: python -m uvicorn server:app --host 0.0.0.0 --port $PORT
+   Do not use "py" on Render; that command is a Windows-only Python launcher.
 
 The blueprint uses Render's free web-service plan. SQLite data is stored in
 hometask.sqlite3 on the service's temporary filesystem, so accounts, jobs, and
