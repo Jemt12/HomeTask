@@ -1,0 +1,20 @@
+# HomeTask private/local data
+hometask.sqlite3
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.DS_Store
+*.log
+# Generated test snapshots
+preview_*.png

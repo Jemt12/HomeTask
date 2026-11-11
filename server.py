@@ -60,7 +60,9 @@ BRAND_ASSETS = {
 @app.get('/assets/{asset_name}')
 def brand_asset(asset_name: str):
     if asset_name not in BRAND_ASSETS: fail(404, 'Asset not found.')
-    return FileResponse(HERE/'brand'/asset_name, media_type='image/png')
+    asset_path = HERE/'brand'/asset_name
+    if not asset_path.is_file(): fail(404, 'Asset not found.')
+    return FileResponse(asset_path, media_type='image/png')
 
 
 @contextmanager
@@ -500,6 +502,34 @@ def init_v14_3():
         c.execute('UPDATE payment_transactions SET checkout_total_cents=agreed_price_cents WHERE checkout_total_cents IS NULL')
 init_v14_3()
 
+# 14.4.6: additive, sandbox-only Connect worker accounts and transfer audit.
+def init_v14_4_6():
+    with conn() as c:
+        c.executescript("""
+          CREATE TABLE IF NOT EXISTS worker_stripe_accounts (
+            worker_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            stripe_account_id TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS worker_test_transfers (
+            job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+            worker_id INTEGER NOT NULL REFERENCES users(id),
+            stripe_account_id TEXT NOT NULL, amount_cents INTEGER NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('processing','transferred','review_required')),
+            transfer_id TEXT UNIQUE, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS completion_review_events (
+            job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL, created_at INTEGER NOT NULL,
+            PRIMARY KEY(job_id,kind,created_at));
+          CREATE TABLE IF NOT EXISTS completion_review_reminders (
+            job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            window TEXT NOT NULL CHECK(window IN ('24h','40h')),
+            sent_at INTEGER NOT NULL, PRIMARY KEY(job_id,window));
+          CREATE INDEX IF NOT EXISTS idx_review_reminders_time ON completion_review_reminders(sent_at);
+        """)
+        columns={r['name'] for r in c.execute('PRAGMA table_info(payment_transactions)')}
+        if 'stripe_charge_id' not in columns:
+            c.execute('ALTER TABLE payment_transactions ADD COLUMN stripe_charge_id TEXT')
+init_v14_4_6()
+
 # Images are resized client-side and checked again server-side for safety.
 def validate_image_data(data:str,max_bytes:int=300000)->str:
     if not data:return ''
@@ -519,6 +549,12 @@ def public_job(job,user_id=None):
     # Full job address and exact coordinates are only shared with the owner and hired worker.
     if user_id is not None and user_id in (job['owner_id'],job.get('assigned_worker_id')):return {**job,**public_map_fields(job)}
     item=job.copy()
+    # Completion review/timeline data is private to the task owner and hired worker.
+    # Public listings are never a source for an internal assignment timeline.
+    for private_field in ('completion_requested_at','completion_note',
+                          'completion_rejected_at','review_deadline_at',
+                          'payout_status','payment_status','payment_mode'):
+        item.pop(private_field,None)
     parts=[p.strip() for p in str(item.get('location') or '').split(',') if p.strip()]
     # Address autocomplete sometimes includes ZIP after city/state; never use ZIP as the public area.
     if parts and re.fullmatch(r'\d{5}(?:-\d{4})?',parts[-1]):parts=parts[:-1]
@@ -644,6 +680,19 @@ def add_previous_work(data:PortfolioIn,req:Request):
         if count>=20:fail(409,'A maximum of 20 previous-work projects is supported.')
         cur=c.execute('INSERT INTO previous_work(worker_id,title,description,category,photo_data,created_at) VALUES(?,?,?,?,?,?)',(u['id'],data.title.strip(),data.description.strip(),data.category,data.photo_data,now()))
         return {'id':cur.lastrowid}
+
+@app.post('/api/previous-work/{item_id}/feature')
+def toggle_featured_previous_work(item_id:int,req:Request):
+    with conn() as c:
+        u=current_user(req,c)
+        item=c.execute('SELECT featured FROM previous_work WHERE id=? AND worker_id=?',(item_id,u['id'])).fetchone()
+        if not item:fail(404,'Portfolio item not found.')
+        featured=0 if item['featured'] else 1
+        if featured:
+            count=c.execute('SELECT COUNT(*) n FROM previous_work WHERE worker_id=? AND featured=1',(u['id'],)).fetchone()['n']
+            if count>=3:fail(409,'You can feature up to three work samples. Unfeature another sample first.')
+        c.execute('UPDATE previous_work SET featured=? WHERE id=?',(featured,item_id))
+        return {'ok':True,'featured':bool(featured)}
 
 @app.get('/api/previous-work/completed-eligible')
 def eligible_completed_work(req:Request):
@@ -780,8 +829,10 @@ def work_finished(job_id:int,data:CompletionIn,req:Request):
         if job['status']!='accepted':fail(409,'Only active assignments can be marked finished.')
         if job['assigned_worker_id']!=u['id']:fail(403,'Only the assigned worker can mark work finished.')
         if job['completion_requested_at']:fail(409,'Completion confirmation is already pending.')
+        c.execute('DELETE FROM completion_review_reminders WHERE job_id=?',(job_id,))
         c.execute('UPDATE jobs SET completion_requested_at=?,completion_note=?,completion_rejected_at=NULL WHERE id=?',(now(),data.note.strip(),job_id))
-        notify(c,job['owner_id'],job_id,'completion_requested',f'Confirm completed work: {job["title"]}',f'{u["name"]} marked the job finished. Review the results and confirm or request changes.')
+        c.execute('INSERT OR IGNORE INTO completion_review_events(job_id,kind,created_at) VALUES(?,?,?)',(job_id,'submitted',now()))
+        notify(c,job['owner_id'],job_id,'completion_requested',f'Confirm completed work: {job["title"]}',f'{u["name"]} marked the job finished. Review the results within 48 hours to approve, request changes, or dispute.')
         return {'job':get_job(c,job_id)}
 
 @app.post('/api/jobs/{job_id}/work-needs-changes')
@@ -792,6 +843,7 @@ def work_needs_changes(job_id:int,data:CompletionIn,req:Request):
         if job['owner_id']!=u['id']:fail(403,'Only the customer can request changes.')
         if job['status']!='accepted' or not job['completion_requested_at']:fail(409,'No completion request is pending.')
         c.execute('UPDATE jobs SET completion_requested_at=NULL,completion_note=?,completion_rejected_at=? WHERE id=?',(data.note.strip(),now(),job_id))
+        c.execute('INSERT OR IGNORE INTO completion_review_events(job_id,kind,created_at) VALUES(?,?,?)',(job_id,'changes_requested',now()))
         notify(c,job['assigned_worker_id'],job_id,'completion_changes',f'Changes requested: {job["title"]}',f'{u["name"]} requested changes: {data.note.strip()}')
         return {'job':get_job(c,job_id)}
 
@@ -803,14 +855,65 @@ def notify(c, user_id, job_id, kind, title, body):
     c.execute('''INSERT INTO notifications(user_id,job_id,kind,title,body,created_at)
                  VALUES(?,?,?,?,?,?)''', (user_id,job_id,kind,title,body,now()))
 
+REVIEW_WINDOW_SECONDS = 48*3600
+
+def review_is_blocked(c,job_id):
+    return c.execute("""SELECT 1 FROM marketplace_reports
+        WHERE target_type='job' AND target_id=? AND category='dispute'
+        AND status IN ('open','reviewing') LIMIT 1""",(job_id,)).fetchone() is not None
+
+def process_completion_reviews(c):
+    """Run deterministically on signed-in API activity; no background scheduler is assumed.
+    This approves completion only; it NEVER initiates a Stripe transfer.
+    """
+    current=now()
+    rows=c.execute("""SELECT j.id,j.title,j.owner_id,j.completion_requested_at,
+              o.worker_id,t.status AS payment_status
+              FROM jobs j JOIN offers o ON o.id=j.accepted_offer_id
+              LEFT JOIN payment_transactions t ON t.job_id=j.id
+              WHERE j.status='accepted' AND j.completion_requested_at IS NOT NULL""").fetchall()
+    for r in rows:
+        start=r['completion_requested_at']
+        if not start or review_is_blocked(c,r['id']):continue
+        passed=current-start
+        for hour,tag in ((24,'24h'),(40,'40h')):
+            if passed>=hour*3600 and passed<REVIEW_WINDOW_SECONDS and (tag=='40h' or passed<40*3600):
+                inserted=c.execute('INSERT OR IGNORE INTO completion_review_reminders(job_id,window,sent_at) VALUES(?,?,?)',
+                                   (r['id'],tag,current))
+                if inserted.rowcount:
+                    notify(c,r['owner_id'],r['id'],'completion_review_reminder',
+                           f'{48-hour} hours left to review: {r["title"]}',
+                           'Review your finished task. Approve, request changes, or open a dispute before the deadline.')
+        if passed>=REVIEW_WINDOW_SECONDS:
+            updated=c.execute("""UPDATE jobs SET status='completed',completed_at=?
+                WHERE id=? AND status='accepted' AND completion_requested_at=?""",(current,r['id'],start))
+            if updated.rowcount:
+                c.execute("""UPDATE payment_transactions SET transfer_status='awaiting_connect_transfer'
+                    WHERE job_id=? AND status='paid_test' AND transfer_status='not_started'""",(r['id'],))
+                c.execute('INSERT OR IGNORE INTO completion_review_events(job_id,kind,created_at) VALUES(?,?,?)',
+                          (r['id'],'auto_approved_48h',current))
+                notify(c,r['worker_id'],r['id'],'completion_confirmed',f'48-hour review completed: {r["title"]}',
+                       'No issue was reported within 48 hours. The task is approved; your test transfer remains subject to payment and account checks.')
+                notify(c,r['owner_id'],r['id'],'completion_auto_approved',f'Review window ended: {r["title"]}',
+                       'The 48-hour review window ended without an open issue. The task was marked completed.')
+
 @app.get('/api/notifications')
 def list_notifications(req:Request):
     with conn() as c:
         u=current_user(req,c)
+        process_completion_reviews(c)
         upcoming_for_user(c,u,True)
         rows=c.execute('SELECT * FROM notifications WHERE user_id=? AND dismissed_at IS NULL ORDER BY id DESC LIMIT 50',(u['id'],)).fetchall()
         return {'notifications':[dictrow(x) for x in rows],
                 'unread':c.execute('SELECT COUNT(*) n FROM notifications WHERE user_id=? AND read_at IS NULL AND dismissed_at IS NULL',(u['id'],)).fetchone()['n']}
+
+@app.post('/api/notifications/read-all')
+def read_all_notifications(req:Request):
+    # Scope the update to the currently authenticated account only.
+    with conn() as c:
+        u=current_user(req,c)
+        cur=c.execute('UPDATE notifications SET read_at=? WHERE user_id=? AND read_at IS NULL AND dismissed_at IS NULL',(now(),u['id']))
+        return {'ok':True,'updated':cur.rowcount}
 
 @app.post('/api/notifications/{notification_id}/read')
 def read_notification(notification_id:int,req:Request):
@@ -1281,6 +1384,104 @@ def stripe_test_request(path, params, idem_key=None):
     except (OSError,ValueError):fail(502,'Stripe test checkout is temporarily unavailable.')
 
 
+def stripe_v2_request(path, payload=None, idem_key=None):
+    """Account v2 JSON API, restricted to HomeTask's Stripe TEST key."""
+    secret=os.getenv('HOMETASK_STRIPE_TEST_SECRET','').strip()
+    if payment_mode()!='stripe_test' or not secret.startswith('sk_test_'):
+        fail(503,'Stripe sandbox must be configured before worker onboarding.')
+    import urllib.request
+    headers={'Authorization':'Bearer '+secret,
+             'Stripe-Version':'2026-10-28.endive',
+             'Content-Type':'application/json'}
+    if idem_key:headers['Idempotency-Key']=idem_key
+    request=urlrequest.Request('https://api.stripe.com/v2/'+path.lstrip('/'),
+             data=json.dumps(payload).encode() if payload is not None else None,
+             headers=headers,method='POST' if payload is not None else 'GET')
+    try:
+        with urlrequest.urlopen(request,timeout=20) as response:
+            return json.loads(response.read().decode())
+    except urlerror.HTTPError as exc:
+        # Do not expose PII or credentials in upstream responses to the browser.
+        code=''
+        try:code=json.loads(exc.read().decode()).get('error',{}).get('code','')
+        except (ValueError,AttributeError):pass
+        if code in ('account_creation_liability_unacknowledged',
+                    'account_creation_liability_unacknowledged_and_identity_verification_incomplete',
+                    'account_creation_requirement_collection_and_liability_unacknowledged',
+                    'account_creation_requirement_collection_and_liability_unacknowledged_and_identity_verification_incomplete'):
+            fail(409,'Stripe requires the platform owner to acknowledge connected-account loss liability in Connect settings before worker onboarding.')
+        if code in ('connect_identity_not_verified','account_creation_identity_verification_incomplete',
+                    'connect_profile_not_submitted','account_create_activation_required'):
+            fail(409,'Stripe Connect platform setup or identity verification is incomplete. Finish it in the Stripe Dashboard.')
+        fail(502,f'Stripe Connect test account request failed (HTTP {exc.code}; code {code or "unavailable"}).')
+    except (OSError,ValueError):fail(502,'Stripe Connect test API temporarily unavailable.')
+
+
+def worker_stripe_transfer_ready(account):
+    """Read v2 recipient status, including v1-shaped compatibility responses."""
+    recipient=(account.get('configuration') or {}).get('recipient') or {}
+    capabilities=recipient.get('capabilities') or {}
+    balance=capabilities.get('stripe_balance') or {}
+    transfer=balance.get('stripe_transfers') or {}
+    if transfer:
+        return transfer.get('status')=='active'
+    return (account.get('capabilities') or {}).get('transfers')=='active'
+
+
+def stripe_worker_account(account_id):
+    return stripe_v2_request('core/accounts/'+urlparse.quote(account_id,safe='')+
+                             '?include%5B%5D=configuration.recipient&include%5B%5D=requirements')
+
+def stripe_test_get(path):
+    """Read authoritative Stripe sandbox state using the local test key only."""
+    secret=os.getenv('HOMETASK_STRIPE_TEST_SECRET','').strip()
+    if payment_mode()!='stripe_test' or not secret.startswith('sk_test_'):
+        fail(503,'Stripe sandbox is not configured.')
+    auth=base64.b64encode((secret+':').encode()).decode()
+    request=urlrequest.Request('https://api.stripe.com/v1/'+path.lstrip('/'),headers={'Authorization':'Basic '+auth})
+    try:
+        with urlrequest.urlopen(request,timeout=15) as response:
+            return json.loads(response.read().decode())
+    except urlerror.HTTPError as exc:
+        fail(502,f'Stripe test account lookup failed (HTTP {exc.code}).')
+    except (OSError,ValueError):fail(502,'Stripe test account lookup is temporarily unavailable.')
+
+# 14.4.1 — optional sandbox account pinning, to prevent accidental test payments
+# into a different Stripe sandbox. Do not expose Stripe credentials to clients.
+def verify_expected_stripe_sandbox():
+    expected=os.getenv('HOMETASK_STRIPE_EXPECTED_ACCOUNT_ID','').strip()
+    if not expected:
+        return  # Existing 14.4 installs remain compatible until they opt in.
+    if not re.fullmatch(r'acct_[A-Za-z0-9]+',expected):
+        fail(503,'Invalid expected Stripe sandbox account ID.')
+    secret=os.getenv('HOMETASK_STRIPE_TEST_SECRET','').strip()
+    if not secret.startswith('sk_test_'):
+        fail(503,'Stripe sandbox test key is missing.')
+    auth=base64.b64encode((secret+':').encode()).decode()
+    request=urlrequest.Request('https://api.stripe.com/v1/account',headers={'Authorization':'Basic '+auth})
+    try:
+        with urlrequest.urlopen(request,timeout=12) as response:
+            account=json.loads(response.read().decode())
+    except (OSError,ValueError):
+        fail(503,'Could not verify Stripe sandbox identity. Checkout blocked for safety.')
+    # /v1/account does not consistently return 'livemode' for sandbox keys.
+    # The sk_test_ prefix is mandatory above; reject an explicit live response,
+    # but do not reject a legitimate sandbox merely because this field is absent.
+    if account.get('id')!=expected or account.get('livemode') is True:
+        fail(503,'The Stripe API key is not for the selected HomeTask sandbox. Checkout blocked.')
+
+@app.get('/api/payments/sandbox-status')
+def sandbox_status(req:Request):
+    with conn() as c:
+        current_user(req,c)
+    mode=payment_mode()
+    expected=os.getenv('HOMETASK_STRIPE_EXPECTED_ACCOUNT_ID','').strip()
+    return {'mode':mode,'sandbox_checkout_ready':mode=='stripe_test',
+            'account_pin_configured':bool(expected),'sandbox_account_id':expected if expected.startswith('acct_') else None,
+            'webhook_configured':bool(os.getenv('HOMETASK_STRIPE_WEBHOOK_SECRET','').startswith('whsec_')),
+            'live_payments_enabled':False,'connect_transfers_enabled':False,
+            'worker_bank_payouts_enabled':False,'review_window_hours_planned':48}
+
 def validate_offer_for_hire(c,job,offer,user):
     if job['owner_id']!=user['id']:fail(403,'Only the customer can hire a worker.')
     if job['status']!='open':fail(409,'This task is no longer open.')
@@ -1340,7 +1541,10 @@ def start_checkout(job_id:int,offer_id:int,req:Request):
         validate_offer_for_hire(c,job,offer,u)
         if has_active_checkout(c,job_id):fail(409,'Checkout already started for this task. Try again after it expires.')
         b=commission_breakdown(offer['price'])
-        creation=now();expires=creation+1800
+        # Stripe requires expires_at to be AT LEAST 30 minutes after it receives
+        # the API request. Never set exactly now()+1800 before network latency.
+        # Use 60 minutes and keep our local checkout lock aligned with Stripe.
+        creation=now();expires=creation+3600
         c.execute("""INSERT INTO payment_transactions(job_id,offer_id,customer_id,worker_id,
           agreed_price_cents,commission_cents,worker_net_cents,service_fee_cents,checkout_total_cents,mode,status,created_at,checkout_expires_at)
           VALUES(?,?,?,?,?,?,?,?,?,?,'checkout_pending',?,?)
@@ -1355,13 +1559,19 @@ def start_checkout(job_id:int,offer_id:int,req:Request):
            b['worker_net_cents'],b['service_fee_cents'],b['checkout_total_cents'],'stripe_test',creation,expires))
         checkout_owner_email=u['email']
     # No SQLite lock is held across an external network request.
+    try:
+        verify_expected_stripe_sandbox()
+    except Exception:
+        with conn() as c:
+            c.execute("UPDATE payment_transactions SET status='failed' WHERE job_id=? AND offer_id=? AND created_at=? AND status='checkout_pending' AND checkout_session_id IS NULL",(job_id,offer_id,creation))
+        raise
     base=os.getenv('HOMETASK_CHECKOUT_RETURN_URL','').strip().rstrip('/')
     if not base:base=str(req.base_url).rstrip('/')
     if not (base.startswith('https://') or base.startswith('http://127.0.0.1') or
             base.startswith('http://localhost') or re.match(r'^http://192\.168\.\d+\.\d+:\d+$',base)):
         fail(400,'Set HOMETASK_CHECKOUT_RETURN_URL to the local development address or an HTTPS site.')
     params={
-      'mode':'payment','payment_method_types[0]':'card',
+      'mode':'payment',
       'line_items[0][price_data][currency]':'usd',
       'line_items[0][price_data][unit_amount]':str(b['agreed_price_cents']),
       'line_items[1][price_data][currency]':'usd',
@@ -1405,6 +1615,102 @@ def verify_stripe_event(body,signature,secret):
         return json.loads(body)
     except (ValueError,KeyError,UnicodeDecodeError):fail(400,'Malformed webhook event.')
 
+def finalize_paid_test_checkout(c, row, session):
+    """Apply verified Stripe payment once, whether from webhook or verified return."""
+    if session.get('id') != row['checkout_session_id']:
+        fail(409, 'Payment session mismatch.')
+    if row['status'] == 'paid_test':
+        return
+    if row['status'] != 'checkout_pending':
+        fail(409, 'This checkout can no longer confirm a hire. Contact support.')
+    if session.get('payment_status') != 'paid':
+        fail(409, 'Stripe has not confirmed the payment yet.')
+    if (session.get('mode') != 'payment' or session.get('currency') != 'usd' or
+            int(session.get('amount_total') or -1) != row['checkout_total_cents']):
+        fail(409, 'Payment amount mismatch; administrator review required.')
+    intent = session.get('payment_intent')
+    if not isinstance(intent, str) or not intent.startswith('pi_'):
+        fail(409, 'Stripe payment confirmation is incomplete.')
+    job = get_job(c, row['job_id'])
+    offer = c.execute('SELECT * FROM offers WHERE id=? AND job_id=?', (row['offer_id'], row['job_id'])).fetchone()
+    customer = c.execute('SELECT * FROM users WHERE id=?', (row['customer_id'],)).fetchone()
+    validate_offer_for_hire(c, job, offer, customer)
+    if offer['worker_id'] != row['worker_id']:
+        fail(409, 'Worker mismatch; administrator review required.')
+    # Both the hire and ledger update use one SQLite transaction. The accepted
+    # job status prevents a second hire even if webhook and browser race.
+    hire_after_payment(c, job, offer)
+    c.execute("""UPDATE payment_transactions SET status='paid_test',paid_at=?,payment_intent_id=?
+                 WHERE job_id=? AND status='checkout_pending'""", (now(), intent, row['job_id']))
+    notify(c, row['customer_id'], row['job_id'], 'payment_test_paid',
+           'Stripe test payment completed', 'Test-mode checkout succeeded. No actual money was charged.')
+
+
+def retrieve_paid_test_checkout(session_id):
+    """Retrieve the actual session server-to-server, never trust a return URL."""
+    secret = os.getenv('HOMETASK_STRIPE_TEST_SECRET', '').strip()
+    if not secret.startswith('sk_test_'):
+        fail(503, 'Stripe sandbox is not configured.')
+    auth = base64.b64encode((secret + ':').encode()).decode()
+    url = 'https://api.stripe.com/v1/checkout/sessions/' + urlparse.quote(session_id, safe='')
+    request = urlrequest.Request(url, headers={'Authorization': 'Basic ' + auth})
+    try:
+        with urlrequest.urlopen(request, timeout=15) as response:
+            return json.loads(response.read().decode())
+    except urlerror.HTTPError:
+        fail(502, 'Stripe could not verify this test checkout.')
+    except (OSError, ValueError):
+        fail(502, 'Stripe verification is temporarily unavailable.')
+
+
+@app.get('/api/payments/pending-checkouts')
+def customer_pending_checkouts(req: Request):
+    """Expose only this customer's pending Stripe test sessions for manual recovery."""
+    with conn() as c:
+        user = current_user(req, c)
+        rows = c.execute("""SELECT t.job_id,t.checkout_session_id,j.title FROM payment_transactions t
+                          JOIN jobs j ON j.id=t.job_id
+                          WHERE t.customer_id=? AND t.status='checkout_pending'
+                          AND t.checkout_session_id IS NOT NULL
+                          ORDER BY t.created_at DESC LIMIT 20""", (user['id'],)).fetchall()
+        return {'checkouts': [dict(row) for row in rows]}
+
+
+@app.post('/api/payments/checkout-confirm/{session_id}')
+def confirm_checkout_return(session_id: str, req: Request):
+    """Browser return recovery if local webhook delivery is delayed/missed."""
+    if payment_mode() != 'stripe_test':
+        fail(503, 'Stripe sandbox checkout is not configured.')
+    if not re.fullmatch(r'cs_test_[A-Za-z0-9_]+', session_id):
+        fail(400, 'Invalid Stripe checkout session.')
+    with conn() as c:
+        user = current_user(req, c)
+        row = c.execute('SELECT * FROM payment_transactions WHERE checkout_session_id=?', (session_id,)).fetchone()
+        if not row or row['customer_id'] != user['id']:
+            fail(404, 'This checkout does not belong to your account.')
+        if row['status'] == 'paid_test':
+            job = get_job(c, row['job_id'])
+            return {'confirmed': job['status'] in ('accepted', 'completed'), 'job_id': row['job_id'],
+                    'worker_name': job.get('assigned_worker_name') or '', 'payment_status': row['status']}
+        if row['status'] != 'checkout_pending':
+            return {'confirmed': False, 'payment_status': row['status'], 'job_id': row['job_id']}
+    # Stripe network request is outside SQLite transaction.
+    session = retrieve_paid_test_checkout(session_id)
+    if session.get('id') != session_id:
+        fail(409, 'Stripe returned a different checkout session.')
+    if session.get('payment_status') != 'paid':
+        return {'confirmed': False, 'payment_status': 'pending', 'job_id': row['job_id']}
+    with conn() as c:
+        user = current_user(req, c)
+        row = c.execute('SELECT * FROM payment_transactions WHERE checkout_session_id=?', (session_id,)).fetchone()
+        if not row or row['customer_id'] != user['id']:
+            fail(404, 'This checkout does not belong to your account.')
+        finalize_paid_test_checkout(c, row, session)
+        job = get_job(c, row['job_id'])
+        return {'confirmed': True, 'job_id': row['job_id'],
+                'worker_name': job.get('assigned_worker_name') or '', 'payment_status': 'paid_test'}
+
+
 @app.post('/api/payments/stripe-webhook')
 async def stripe_webhook(req:Request):
     if payment_mode()!='stripe_test':fail(503,'Test webhooks are not enabled.')
@@ -1420,32 +1726,156 @@ async def stripe_webhook(req:Request):
             if not row:fail(409,'Unknown payment session. Requires administrator reconciliation.')
             if row['status']=='checkout_pending':
                 if kind=='checkout.session.completed':
-                    if session.get('payment_status')!='paid':fail(409,'Payment not yet paid.')
-                    if session.get('currency')!='usd' or session.get('mode')!='payment' or int(session.get('amount_total') or -1)!=row['checkout_total_cents']:
-                        fail(409,'Payment amount mismatch; manual reconciliation required.')
-                    job=get_job(c,row['job_id'])
-                    offer=c.execute('SELECT * FROM offers WHERE id=? AND job_id=?',(row['offer_id'],row['job_id'])).fetchone()
-                    customer=c.execute('SELECT * FROM users WHERE id=?',(row['customer_id'],)).fetchone()
-                    validate_offer_for_hire(c,job,offer,customer)
-                    if not offer or offer['worker_id']!=row['worker_id']:fail(409,'Worker mismatch.')
-                    intent=session.get('payment_intent')
-                    if not isinstance(intent,str):fail(409,'Missing payment intent.')
-                    c.execute("""UPDATE payment_transactions SET status='paid_test',paid_at=?,payment_intent_id=?
-                                 WHERE job_id=? AND status='checkout_pending' """,(now(),intent,row['job_id']))
-                    hire_after_payment(c,job,offer)
-                    notify(c,row['customer_id'],row['job_id'],'payment_test_paid',
-                           'Stripe test payment completed','Test-mode checkout succeeded. No actual money was charged.')
+                    finalize_paid_test_checkout(c, row, session)
                 else:
                     c.execute('UPDATE payment_transactions SET status=? WHERE job_id=?',
                               ('expired' if kind=='checkout.session.expired' else 'failed',row['job_id']))
         c.execute('INSERT INTO payment_webhook_events(event_id,received_at) VALUES(?,?)',(event_id,now()))
     return {'ok':True}
 
+def worker_connect_record(c,worker_id):
+    return c.execute('SELECT * FROM worker_stripe_accounts WHERE worker_id=?',(worker_id,)).fetchone()
+
+def connect_return_url(req):
+    root=os.getenv('HOMETASK_CHECKOUT_RETURN_URL','').strip().rstrip('/') or str(req.base_url).rstrip('/')
+    if not (root.startswith('https://') or root.startswith('http://127.0.0.1:') or root.startswith('http://localhost:')):
+        fail(400,'For Stripe onboarding, set HOMETASK_CHECKOUT_RETURN_URL to localhost or an HTTPS URL.')
+    return root+'/?connect=returned'
+
+@app.get('/api/connect/worker-status')
+def worker_connect_status(req:Request):
+    with conn() as c:
+        user=current_user(req,c)
+        if user['role']!='worker':fail(403,'Switch to Worker Portal.')
+        row=worker_connect_record(c,user['id'])
+    if not row:return {'connected':False,'transfers_ready':False,'sandbox_only':True}
+    account=stripe_worker_account(row['stripe_account_id'])
+    # A connected account can exist even when Stripe-hosted onboarding was closed.
+    # Returning 'connected' for that case allows workers to resume rather than
+    # creating a duplicate account. Never use these display flags to authorize transfers.
+    ready=worker_stripe_transfer_ready(account)
+    acct=row['stripe_account_id']
+    return {'connected':True,'transfers_ready':ready,
+            'account_reference':'…'+acct[-6:],
+            'details_submitted':ready,
+            'payouts_enabled':ready,'sandbox_only':True}
+
+@app.post('/api/connect/start')
+def worker_connect_start(req:Request):
+    if payment_mode()!='stripe_test':fail(503,'Worker onboarding requires a configured Stripe sandbox.')
+    with conn() as c:
+        user=current_user(req,c)
+        require_verified_email(user)
+        if user['role']!='worker':fail(403,'Switch to Worker Portal first.')
+        existing=worker_connect_record(c,user['id'])
+        worker_id=user['id'];email=user['email']
+    verify_expected_stripe_sandbox()
+    if existing:
+        acct=existing['stripe_account_id']
+    else:
+        created=stripe_v2_request('core/accounts',{
+                    'contact_email':email, 'identity':{'country':'us'},
+                    'dashboard':'express',
+                    'defaults':{'responsibilities':{'fees_collector':'application','losses_collector':'application'}},
+                    'configuration':{'recipient':{'capabilities':{'stripe_balance':{'stripe_transfers':{'requested':True}}}}},
+                    'metadata':{'hometask_user_id':str(worker_id)}},
+                    f'ht_worker_v2_test_{worker_id}')
+        acct=created.get('id','')
+        if not re.fullmatch(r'acct_[A-Za-z0-9]+',acct):fail(502,'Stripe did not create a connected account.')
+        with conn() as c:
+            u=current_user(req,c)
+            if u['id']!=worker_id:fail(403,'Your login changed during onboarding.')
+            c.execute('INSERT OR IGNORE INTO worker_stripe_accounts(worker_id,stripe_account_id,created_at) VALUES(?,?,?)',
+                      (worker_id,acct,now()))
+            current=worker_connect_record(c,worker_id)
+            if current['stripe_account_id']!=acct:fail(409,'Worker already has a different connected account.')
+    url=connect_return_url(req)
+    result=stripe_test_request('account_links',{'account':acct,'type':'account_onboarding',
+          'return_url':url,'refresh_url':url},None)
+    link=result.get('url','')
+    if not link.startswith('https://'):fail(502,'Stripe did not return a secure onboarding link.')
+    return {'url':link,'sandbox_only':True}
+
+@app.post('/api/connect/test-transfer/{job_id}')
+def request_worker_test_transfer(job_id:int,req:Request):
+    """User-triggered test transfer; never issues live transfers or silently auto-transfers.
+    Failure after a provider request remains review_required to avoid double pay.
+    """
+    if payment_mode()!='stripe_test':fail(503,'Sandbox transfers only.')
+    verify_expected_stripe_sandbox()
+    with conn() as c:
+        user=current_user(req,c)
+        if user['role']!='worker':fail(403,'Switch to Worker Portal.')
+        process_completion_reviews(c)
+        job=get_job(c,job_id)
+        if job['assigned_worker_id']!=user['id']:fail(403,'This is not your task.')
+        if job['status']!='completed':fail(409,'Customer approval or the 48-hour review deadline is required.')
+        if review_is_blocked(c,job_id):fail(409,'A dispute is open. Transfer is blocked.')
+        tx=c.execute('SELECT * FROM payment_transactions WHERE job_id=?',(job_id,)).fetchone()
+        if not tx or tx['mode']!='stripe_test' or tx['status']!='paid_test':fail(409,'A verified paid Stripe test transaction is required.')
+        if tx['transfer_status'] not in ('awaiting_connect_transfer','not_started'):
+            fail(409,'This transfer is already processing or requires manual review.')
+        if c.execute('SELECT 1 FROM worker_test_transfers WHERE job_id=?',(job_id,)).fetchone():
+            fail(409,'A test transfer attempt already exists. Do not retry without reconciliation.')
+        linked=worker_connect_record(c,user['id'])
+        if not linked:fail(409,'Connect Stripe before requesting a test transfer.')
+        account_id=linked['stripe_account_id'];amount=tx['worker_net_cents']
+        intent_id=tx['payment_intent_id']
+    # Check Stripe server-to-server BEFORE reserving a transfer. No browser fields are trusted.
+    account=stripe_worker_account(account_id)
+    if not worker_stripe_transfer_ready(account):
+        fail(409,'Stripe onboarding is incomplete; transfers are not enabled.')
+    intent=stripe_test_get('payment_intents/'+urlparse.quote(intent_id,safe=''))
+    if intent.get('status')!='succeeded' or intent.get('currency')!='usd' or intent.get('amount')!=tx['checkout_total_cents']:
+        fail(409,'Stripe payment requires reconciliation before transferring.')
+    if intent.get('latest_charge') is None:fail(409,'Charge is not available yet.')
+    charge_id=intent['latest_charge']
+    if isinstance(charge_id,dict):charge_id=charge_id.get('id','')
+    if not isinstance(charge_id,str) or not charge_id.startswith('ch_'):fail(409,'Stripe charge could not be verified.')
+    charge=stripe_test_get('charges/'+urlparse.quote(charge_id,safe=''))
+    if charge.get('paid') is not True or charge.get('refunded') or charge.get('disputed') or charge.get('amount_refunded',0):
+        fail(409,'Stripe charge is refunded, disputed, or unverified.')
+    # Only one process may reserve a specific job. SQLite constraint is the final guard.
+    with conn() as c:
+        user=current_user(req,c)
+        process_completion_reviews(c)
+        job=get_job(c,job_id)
+        if job['status']!='completed' or job['assigned_worker_id']!=user['id'] or review_is_blocked(c,job_id):
+            fail(409,'The task is no longer transfer eligible.')
+        tx2=c.execute('SELECT * FROM payment_transactions WHERE job_id=?',(job_id,)).fetchone()
+        if not tx2 or tx2['status']!='paid_test' or tx2['transfer_status'] not in ('awaiting_connect_transfer','not_started'):
+            fail(409,'Payment transfer is no longer eligible.')
+        c.execute('INSERT INTO worker_test_transfers(job_id,worker_id,stripe_account_id,amount_cents,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?)',
+                  (job_id,user['id'],account_id,amount,'processing',now(),now()))
+        c.execute("UPDATE payment_transactions SET transfer_status='transfer_processing' WHERE job_id=?",(job_id,))
+    try:
+        result=stripe_test_request('transfers',{'amount':str(amount),'currency':'usd','destination':account_id,
+                  'source_transaction':charge_id,'transfer_group':f'hometask_job_{job_id}',
+                  'metadata[hometask_job_id]':str(job_id)},f'ht_worker_transfer_test_job_{job_id}')
+    except Exception:
+        with conn() as c:
+            c.execute("UPDATE worker_test_transfers SET state='review_required',updated_at=? WHERE job_id=?",(now(),job_id))
+            c.execute("UPDATE payment_transactions SET transfer_status='transfer_review' WHERE job_id=?",(job_id,))
+        raise
+    transfer_id=result.get('id','')
+    if not isinstance(transfer_id,str) or not transfer_id.startswith('tr_'):
+        with conn() as c:
+            c.execute("UPDATE worker_test_transfers SET state='review_required',updated_at=? WHERE job_id=?",(now(),job_id))
+            c.execute("UPDATE payment_transactions SET transfer_status='transfer_review' WHERE job_id=?",(job_id,))
+        fail(502,'Stripe transfer response requires manual review.')
+    with conn() as c:
+        c.execute("UPDATE worker_test_transfers SET state='transferred',transfer_id=?,updated_at=? WHERE job_id=?",(transfer_id,now(),job_id))
+        c.execute("UPDATE payment_transactions SET transfer_status='transferred_test' WHERE job_id=?",(job_id,))
+        notify(c,user['id'],job_id,'payout_test_transferred','Test transfer completed',
+               f'Stripe confirmed a sandbox transfer of ${amount/100:.2f}. This is not a real bank payout.')
+    return {'ok':True,'transfer_status':'transferred_test','amount_cents':amount,'sandbox_only':True}
+
 @app.get('/api/payments/overview')
 def payment_readiness(req:Request):
     with conn() as c:
         u=current_user(req,c)
-        rows=c.execute("""SELECT j.id,j.title,j.status job_status,o.price agreed_price,j.owner_id,o.worker_id,
+        process_completion_reviews(c)
+        rows=c.execute("""SELECT j.id,j.title,j.status job_status,j.completion_requested_at,o.price agreed_price,j.owner_id,o.worker_id,
            t.status payment_status,t.mode payment_mode,t.transfer_status,t.agreed_price_cents,t.commission_cents,t.worker_net_cents,t.service_fee_cents,t.checkout_total_cents
            FROM jobs j JOIN offers o ON o.id=j.accepted_offer_id
            LEFT JOIN payment_transactions t ON t.job_id=j.id
@@ -1457,7 +1887,9 @@ def payment_readiness(req:Request):
             item={'job_id':r['id'],'title':r['title'],'job_status':r['job_status'],
                   'agreed_job_value':r['agreed_price'],'payment_status':r['payment_status'] or 'not_processed',
                   'payment_mode':r['payment_mode'] or 'none','real_money_collected':False,
-                  'transfer_status':r['transfer_status'] or 'not_started'}
+                  'transfer_status':r['transfer_status'] or 'not_started',
+                  'review_deadline_at':(r['completion_requested_at']+REVIEW_WINDOW_SECONDS) if r['completion_requested_at'] and r['job_status']=='accepted' else None,
+                  'review_blocked':review_is_blocked(c,r['id'])}
             if worker:
                 item.update({'commission_cents':r['commission_cents'] if r['commission_cents'] is not None else b['commission_cents'],
                              'net_payout_cents':r['worker_net_cents'] if r['worker_net_cents'] is not None else b['worker_net_cents']})
@@ -1592,19 +2024,63 @@ def submit_review(job_id:int,data:ReviewIn,req:Request):
                f'{user["name"]} left you a {data.rating}-star review.')
         return {'ok':True}
 
+
+# 15.3: additive review responses. No changes to Stripe or existing reviews.
+def init_v15_3():
+    with conn() as c:
+        cols={r['name'] for r in c.execute('PRAGMA table_info(reviews)')}
+        if 'recipient_reply' not in cols:
+            c.execute("ALTER TABLE reviews ADD COLUMN recipient_reply TEXT NOT NULL DEFAULT ''")
+        if 'reply_at' not in cols:
+            c.execute('ALTER TABLE reviews ADD COLUMN reply_at INTEGER')
+        portfolio_cols={r['name'] for r in c.execute('PRAGMA table_info(previous_work)')}
+        if 'featured' not in portfolio_cols:
+            c.execute('ALTER TABLE previous_work ADD COLUMN featured INTEGER NOT NULL DEFAULT 0')
+init_v15_3()
+
+class ReviewReplyIn(BaseModel):
+    text:str=Field(min_length=1,max_length=600)
+
+@app.post('/api/reviews/{review_id}/reply')
+def reply_to_review(review_id:int,data:ReviewReplyIn,req:Request):
+    with conn() as c:
+        u=current_user(req,c)
+        row=c.execute('SELECT recipient_id,author_id,recipient_reply FROM reviews WHERE id=?',(review_id,)).fetchone()
+        if not row:fail(404,'Review not found.')
+        if row['recipient_id']!=u['id']:fail(403,'Only the reviewed person can respond.')
+        if row['recipient_reply']:fail(409,'A response has already been submitted. Contact support to report a problem.')
+        body=data.text.strip()
+        if not body:fail(400,'Enter a response.')
+        c.execute('UPDATE reviews SET recipient_reply=?,reply_at=? WHERE id=?',(body,now(),review_id))
+        notify(c,row['author_id'],None,'review_reply','Your review received a response',
+               f'{u["name"]} responded to your review.')
+        return {'ok':True}
+
+@app.delete('/api/admin/reviews/{review_id}/reply')
+def moderate_review_reply(review_id:int,req:Request):
+    with conn() as c:
+        u=current_user(req,c)
+        if not u['is_admin']:fail(403,'Admin access required.')
+        row=c.execute('SELECT recipient_reply FROM reviews WHERE id=?',(review_id,)).fetchone()
+        if not row:fail(404,'Review not found.')
+        c.execute("UPDATE reviews SET recipient_reply='',reply_at=NULL WHERE id=?",(review_id,))
+        audit(c,u['id'],'review_response_removed','review',review_id,'Removed public review response')
+        return {'ok':True}
+
 @app.get('/api/workers/{worker_id}')
 def public_worker(worker_id:int,req:Request):
     with conn() as c:
-        row=c.execute("SELECT id,name,role,bio,skills,location,avatar_data,banner_data,account_status FROM users WHERE id=?",(worker_id,)).fetchone()
+        row=c.execute("SELECT id,name,role,bio,skills,location,avatar_data,banner_data,account_status,created_at FROM users WHERE id=?",(worker_id,)).fetchone()
         if not row or row['account_status']!='active': fail(404,'Worker not found.')
         try:viewer=current_user(req,c)
         except HTTPException:viewer=None
         completed=c.execute('''SELECT COUNT(*) n FROM jobs j JOIN offers o ON j.accepted_offer_id=o.id
           WHERE j.status='completed' AND o.worker_id=?''',(worker_id,)).fetchone()['n']
         rating=c.execute('SELECT COUNT(*) n,ROUND(AVG(rating),1) avg FROM reviews WHERE recipient_id=?',(worker_id,)).fetchone()
-        recent=[dictrow(x) for x in c.execute('''SELECT r.rating,r.comment,r.photo_data,r.created_at,u.name author_name FROM reviews r
+        recent=[dictrow(x) for x in c.execute('''SELECT r.id,r.rating,r.comment,r.photo_data,r.created_at,r.recipient_reply,r.reply_at,u.name author_name FROM reviews r
           JOIN users u ON u.id=r.author_id WHERE r.recipient_id=? ORDER BY r.id DESC LIMIT 8''',(worker_id,))]
-        portfolio=[dictrow(r) for r in c.execute('SELECT id,title,description,category,photo_data,created_at FROM previous_work WHERE worker_id=? ORDER BY id DESC LIMIT 20',(worker_id,))]
+        breakdown={int(r['rating']):int(r['n']) for r in c.execute('SELECT rating,COUNT(*) n FROM reviews WHERE recipient_id=? GROUP BY rating',(worker_id,))}
+        portfolio=[dictrow(r) for r in c.execute('SELECT id,title,description,category,photo_data,created_at,featured FROM previous_work WHERE worker_id=? ORDER BY featured DESC,id DESC LIMIT 20',(worker_id,))]
         confirmed_highlights=[dictrow(r) for r in c.execute("""SELECT j.category,j.completed_at FROM completed_work_highlights h JOIN jobs j ON j.id=h.job_id JOIN offers o ON o.id=j.accepted_offer_id WHERE h.worker_id=? AND o.worker_id=? AND j.status='completed' AND j.moderation_status='visible' ORDER BY j.completed_at DESC LIMIT 20""",(worker_id,worker_id))]
         followers=c.execute('SELECT COUNT(*) n FROM worker_follows WHERE worker_id=?',(worker_id,)).fetchone()['n']
         postings=c.execute('SELECT COUNT(*) n FROM jobs WHERE owner_id=?',(worker_id,)).fetchone()['n']
@@ -1622,8 +2098,12 @@ def public_worker(worker_id:int,req:Request):
             WHERE j.status='completed' AND j.moderation_status='visible' AND o.worker_id=?
             ORDER BY j.completed_at DESC,j.id DESC LIMIT 6''',(worker_id,)):
             linked.append(dictrow(r))
-        return {**{k:row[k] for k in ('id','name','role','bio','skills','location','avatar_data','banner_data')},'verified_results':linked,'completed_jobs':completed,'review_count':rating['n'],'rating':rating['avg'],
-          'reviews':recent,'portfolio':portfolio,'completed_highlights':confirmed_highlights,'follower_count':followers,'posted_jobs':postings,'is_following':following,'is_blocked':is_blocked,
+        public_open_tasks=[]
+        for task_row in c.execute('''SELECT id FROM jobs WHERE owner_id=? AND status='open' AND moderation_status='visible' ORDER BY created_at DESC LIMIT 40''',(worker_id,)):
+            listing=public_job(get_job(c,task_row['id']),viewer['id'] if viewer and viewer['id']==worker_id else None)
+            public_open_tasks.append({key:listing.get(key) for key in ('id','title','category','location','budget','status','has_main_photo')})
+        return {**{k:row[k] for k in ('id','name','role','bio','skills','location','avatar_data','banner_data')},'public_open_tasks':public_open_tasks,'verified_results':linked,'completed_jobs':completed,'review_count':rating['n'],'rating':rating['avg'],
+          'reviews':recent,'review_breakdown':breakdown,'member_since':row['created_at'],'portfolio':portfolio,'completed_highlights':confirmed_highlights,'follower_count':followers,'posted_jobs':postings,'is_following':following,'is_blocked':is_blocked,
           'verification':'Verified' if verified else 'Not verified',
           'profile_verified':verified,'profile_reviewed':verified,'image_framing':framing_for(c,worker_id)}
 
@@ -1642,11 +2122,13 @@ def get_job(c,id):
     result['payment_status']=tx['status'] if tx else 'not_processed'
     result['payment_mode']=tx['mode'] if tx else 'none'
     result['payout_status']=tx['transfer_status'] if tx else 'not_started'
+    result['review_deadline_at']=(result['completion_requested_at']+REVIEW_WINDOW_SECONDS) if result.get('completion_requested_at') and result['status']=='accepted' else None
     return result
 
 @app.get('/api/jobs')
 def list_jobs(req:Request):
     with conn() as c:
+        process_completion_reviews(c)
         try:u=current_user(req,c)
         except HTTPException:u=None
         rows=c.execute("""SELECT j.id FROM jobs j JOIN users owner ON owner.id=j.owner_id WHERE ((j.moderation_status='visible' AND owner.account_status='active') OR j.owner_id=?) AND NOT EXISTS (SELECT 1 FROM user_blocks b WHERE (b.blocker_id=? AND b.blocked_id=j.owner_id) OR (b.blocker_id=j.owner_id AND b.blocked_id=?)) ORDER BY j.created_at DESC,j.id DESC""",(u['id'] if u else -1,u['id'] if u else -1,u['id'] if u else -1,)).fetchall()
@@ -1976,6 +2458,68 @@ def worker_earnings(req:Request,granularity:str='month',range:str='all',start:Op
                 'commission_bps':HOMETASK_COMMISSION_BPS,
                 'payouts_are_real':False}
 
+# 15.2: additive private named drafts. Legacy single autosave draft remains intact.
+def ensure_saved_drafts_table():
+    with conn() as c:
+        c.execute('''CREATE TABLE IF NOT EXISTS saved_task_drafts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            draft_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL)''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_saved_task_drafts_user ON saved_task_drafts(user_id,updated_at DESC)')
+ensure_saved_drafts_table()
+
+def validate_saved_task_draft(fields):
+    if not isinstance(fields,dict) or len(json.dumps(fields))>12000:
+        fail(400,'Draft is too large or invalid.')
+    permitted=('title','category','description','location','difficulty','budget','latitude','longitude','duration_minutes','flexible_schedule','offer_deadline','slots')
+    clean={k:fields.get(k) for k in permitted if k in fields}
+    if any(len(str(clean.get(k) or ''))>2200 for k in ('title','category','description','location','difficulty','offer_deadline')):
+        fail(400,'Draft field is too long.')
+    if 'slots' in clean and (not isinstance(clean['slots'],list) or len(clean['slots'])>8):
+        fail(400,'Invalid draft schedule.')
+    return clean
+
+@app.get('/api/job-drafts')
+def list_saved_task_drafts(req:Request):
+    with conn() as c:
+        u=current_user(req,c)
+        if u['role']!='customer':fail(403,'Customer access required.')
+        rows=c.execute('SELECT id,draft_json,created_at,updated_at FROM saved_task_drafts WHERE user_id=? ORDER BY updated_at DESC,id DESC',(u['id'],)).fetchall()
+        return {'drafts':[{'id':r['id'],'fields':json.loads(r['draft_json']),'created_at':r['created_at'],'updated_at':r['updated_at']} for r in rows]}
+
+@app.post('/api/job-drafts')
+def create_saved_task_draft(data:JobDraftIn,req:Request):
+    fields=validate_saved_task_draft(data.fields)
+    with conn() as c:
+        u=current_user(req,c)
+        if u['role']!='customer':fail(403,'Customer access required.')
+        if c.execute('SELECT COUNT(*) n FROM saved_task_drafts WHERE user_id=?',(u['id'],)).fetchone()['n']>=30:
+            fail(409,'Maximum 30 saved drafts. Delete one to save another.')
+        stamp=now()
+        cur=c.execute('INSERT INTO saved_task_drafts(user_id,draft_json,created_at,updated_at) VALUES(?,?,?,?)',(u['id'],json.dumps(fields),stamp,stamp))
+        return {'id':cur.lastrowid,'ok':True}
+
+@app.put('/api/job-drafts/{draft_id}')
+def update_saved_task_draft(draft_id:int,data:JobDraftIn,req:Request):
+    fields=validate_saved_task_draft(data.fields)
+    with conn() as c:
+        u=current_user(req,c)
+        if u['role']!='customer':fail(403,'Customer access required.')
+        if not c.execute('UPDATE saved_task_drafts SET draft_json=?,updated_at=? WHERE id=? AND user_id=?',(json.dumps(fields),now(),draft_id,u['id'])).rowcount:
+            fail(404,'Draft not found.')
+        return {'ok':True}
+
+@app.delete('/api/job-drafts/{draft_id}')
+def delete_saved_task_draft(draft_id:int,req:Request):
+    with conn() as c:
+        u=current_user(req,c)
+        if u['role']!='customer':fail(403,'Customer access required.')
+        if not c.execute('DELETE FROM saved_task_drafts WHERE id=? AND user_id=?',(draft_id,u['id'])).rowcount:
+            fail(404,'Draft not found.')
+        return {'ok':True}
+
 # 14.2: a single server-side autosaved, private posting draft per account.
 DRAFT_FIELDS = ('title','category','description','location','difficulty','budget','latitude','longitude','duration_minutes','flexible_schedule','offer_deadline','slots')
 @app.get('/api/job-draft')
@@ -2113,6 +2657,7 @@ def upcoming_jobs(req:Request):
 @app.get('/api/jobs/{job_id}')
 def job_detail(job_id:int,req:Request):
     with conn() as c:
+        process_completion_reviews(c)
         job=get_job(c,job_id)
         owner_status=c.execute('SELECT account_status FROM users WHERE id=?',(job['owner_id'],)).fetchone()['account_status']
         if job.get('moderation_status')=='removed' or owner_status!='active':
@@ -2130,6 +2675,18 @@ def job_detail(job_id:int,req:Request):
             job['offers']=[dictrow(row) for row in offer_rows if row['worker_id']==user['id']]
         else: job['offers']=[]
         return public_job(job,user['id'] if user else None)
+
+@app.get('/api/jobs/{job_id}/workspace')
+def task_workspace(job_id:int,req:Request):
+    # Never rely on frontend visibility alone for private task-management data.
+    with conn() as c:
+        u=current_user(req,c)
+        j=get_job(c,job_id)
+        if not j.get('accepted_offer_id') or not j.get('assigned_worker_id'):
+            fail(403,'A private workspace becomes available only after a worker is hired.')
+        if u['id'] not in (j['owner_id'],j['assigned_worker_id']):
+            fail(403,'Only the customer and hired worker can view this workspace.')
+        return {'job':public_job(j,u['id'])}
 
 @app.post('/api/jobs')
 def create_job(data:JobIn,req:Request):
@@ -2234,7 +2791,9 @@ def complete_job(job_id:int,req:Request):
         if job['owner_id']!=user['id']: fail(403,'Not your job.')
         if job['status']!='accepted': fail(409,'Only accepted jobs can be completed.')
         if not job['completion_requested_at']:fail(409,'The worker must mark the work finished before you can confirm completion.')
+        if review_is_blocked(c,job_id):fail(409,'A job dispute is open. Administrator review is required before approval.')
         c.execute("UPDATE jobs SET status='completed',completed_at=? WHERE id=?",(now(),job_id))
+        c.execute('INSERT OR IGNORE INTO completion_review_events(job_id,kind,created_at) VALUES(?,?,?)',(job_id,'customer_approved',now()))
         c.execute("UPDATE payment_transactions SET transfer_status='awaiting_connect_transfer' WHERE job_id=? AND status='paid_test'",(job_id,))
         notify(c,job['assigned_worker_id'],job_id,'completion_confirmed',f'Job completed: {job["title"]}',
                'The customer confirmed your completed work. The job is now in History.')
@@ -2491,6 +3050,23 @@ def approve_reschedule(job_id:int,req:Request):
                f'The new appointment at {row["start_time"].replace("T"," ")} Eastern is now confirmed.')
         sync_appointment(c,job_id)
         return {'job':get_job(c,job_id)}
+
+@app.post('/api/jobs/{job_id}/reschedule/decline')
+def decline_reschedule(job_id:int,req:Request):
+    with conn() as c:
+        u=current_user(req,c);j=get_job(c,job_id)
+        if j['status']!='accepted' or u['id'] not in appointment_participants(c,j):
+            fail(403,'Not an assigned participant.')
+        c.execute('''CREATE TABLE IF NOT EXISTS reschedule_requests (
+            job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+            requester_id INTEGER NOT NULL,start_time TEXT NOT NULL,end_time TEXT NOT NULL)''')
+        row=c.execute('SELECT * FROM reschedule_requests WHERE job_id=?',(job_id,)).fetchone()
+        if not row:fail(404,'No pending time change request.')
+        if row['requester_id']==u['id']:fail(403,'Only the other participant can decline.')
+        c.execute('DELETE FROM reschedule_requests WHERE job_id=?',(job_id,))
+        notify(c,row['requester_id'],job_id,'reschedule_declined',f'Time change declined: {j["title"]}',
+               'The other participant declined your proposed schedule. The previously confirmed time has not changed.')
+        return {'ok':True}
 
 @app.get('/api/jobs/{job_id}/calendar.ics')
 def download_calendar(job_id:int,req:Request):

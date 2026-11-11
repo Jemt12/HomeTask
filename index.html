@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/assets/styles.css?v=1440" />
+  <link rel="stylesheet" href="/assets/styles.css?v=1562" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 </head>
 <body>
@@ -23,14 +23,14 @@
 
       <nav class="desktop-nav">
         <button data-view="browse">Browse jobs</button>
-        <button data-view="post">Post a task</button>
+        <div class="ht153-post-nav"><button data-view="post">Post a task</button><div class="ht153-post-menu"><button data-view="saved-drafts">View saved drafts</button></div></div>
         <button data-view="dashboard">Dashboard</button>
       </nav>
 
       <div class="header-actions">
         <button id="mobileMenuButton" class="mobile-menu-button" type="button" aria-label="Open navigation menu" aria-expanded="false" aria-controls="mobileMenuOverlay"><svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
         <button id="notificationBell" class="notification-bell" type="button" aria-label="View notifications" title="Notifications"><svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 8-3 9h18c0-1-3-2-3-9Zm-8 12a2 2 0 0 0 4 0"/></svg><span id="notificationBadge" class="notification-count" hidden>0</span></button>
-        <div class="profile-shell" id="profileShell"><button class="guest-sign-in" id="profileButton" type="button" aria-label="Sign in to HomeTask" aria-expanded="false">Sign in</button><div class="profile-dropdown" id="profileMenu" role="menu" hidden><div class="profile-dropdown-heading">Your account</div><button role="menuitem" data-profile-link="profile">My profile</button><button role="menuitem" data-profile-link="settings">Settings</button><button role="menuitem" data-profile-link="analytics">Analytics</button><button role="menuitem" data-profile-link="appointments">Appointments</button><button role="menuitem" data-profile-link="history">Job history</button><div id="adminMenuBlock" hidden><div class="dropdown-divider"></div><div class="profile-dropdown-heading">ADMINISTRATION</div><button role="menuitem" data-profile-link="admin">Admin Dashboard</button></div><button role="menuitem" data-profile-link="my-reviews">My reviews</button><button role="menuitem" data-profile-link="following">Following</button><button role="menuitem" data-profile-link="saved-jobs">Saved jobs</button><button role="menuitem" data-profile-link="previous-work">Previous Work</button><button role="menuitem" data-profile-link="worker-availability">Weekly availability</button><button role="menuitem" data-profile-link="verification">Get verified</button><div class="dropdown-divider"></div><div class="profile-dropdown-heading">Switch workspace</div><button role="menuitem" data-switch-role="customer">HomeTask</button><button role="menuitem" data-switch-role="worker">Worker Portal</button></div></div>
+        <div class="profile-shell" id="profileShell"><button class="guest-sign-in" id="profileButton" type="button" aria-label="Sign in to HomeTask" aria-expanded="false">Sign in</button><div class="profile-dropdown" id="profileMenu" role="menu" hidden><div class="profile-dropdown-heading">Your account</div><button role="menuitem" data-profile-link="profile">My profile</button><button role="menuitem" data-profile-link="settings">Settings</button><button role="menuitem" data-profile-link="analytics">Analytics</button><button role="menuitem" data-profile-link="appointments">Appointments</button><button role="menuitem" data-profile-link="history">Job history</button><button role="menuitem" data-profile-link="saved-drafts">Saved drafts</button><div id="adminMenuBlock" hidden><div class="dropdown-divider"></div><div class="profile-dropdown-heading">ADMINISTRATION</div><button role="menuitem" data-profile-link="admin">Admin Dashboard</button></div><button role="menuitem" data-profile-link="my-reviews">My reviews</button><button role="menuitem" data-profile-link="following">Following</button><button role="menuitem" data-profile-link="saved-jobs">Saved jobs</button><button role="menuitem" data-profile-link="previous-work">Previous Work</button><button role="menuitem" data-profile-link="worker-availability">Weekly availability</button><button role="menuitem" data-profile-link="verification">Get verified</button><div class="dropdown-divider"></div><div class="profile-dropdown-heading">Switch workspace</div><button role="menuitem" data-switch-role="customer">HomeTask</button><button role="menuitem" data-switch-role="worker">Worker Portal</button></div></div>
       </div>
     </header>
 
@@ -38,17 +38,18 @@
 
     <footer>
       <div>
-        <span class="footer-brand"><img src="/assets/logo-2-icon.png" alt="" /><img src="/assets/logo-2-wordmark.png" alt="HomeTask" /></span>
+        <span class="footer-brand"><img src="/assets/logo-1-icon.png" alt="" /><img src="/assets/logo-1-wordmark.png" alt="HomeTask" /></span>
         <span>Small jobs. Local people. Simple offers.</span>
       </div>
-      <p>HomeTask 14.4 • MGIS 550 capstone prototype • Shared local SQLite database</p>
+      <p>HomeTask 15.6.2 • MGIS 550 capstone prototype • Shared local SQLite database</p>
     </footer>
   </div>
 
+  <div id="ht154GlobalProgress" class="ht154-global-progress" role="progressbar" aria-label="Loading HomeTask data" hidden><span></span></div>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <div id="modalRoot"></div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script src="/assets/app.js?v=1440"></script>
+  <script src="/assets/app.js?v=1562"></script>
 </body>
 </html>
