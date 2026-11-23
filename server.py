@@ -57,6 +57,15 @@ BRAND_ASSETS = {
     'logo-2-icon.png', 'logo-2-wordmark.png', 'logo-2-stacked.png',
     'favicon-32.png', 'favicon-180.png', 'verified-house.png'
 }
+# Curated public marketing illustrations only. Never expose demo or uploaded user files.
+MARKETING_ASSETS = {'desk-assembly.webp', 'desk-project.webp'}
+@app.get('/marketing/{asset_name}')
+def marketing_asset(asset_name: str):
+    if asset_name not in MARKETING_ASSETS: fail(404, 'Asset not found.')
+    asset_path = HERE/'marketing'/asset_name
+    if not asset_path.is_file(): fail(404, 'Asset not found.')
+    return FileResponse(asset_path, media_type='image/webp')
+
 @app.get('/assets/{asset_name}')
 def brand_asset(asset_name: str):
     if asset_name not in BRAND_ASSETS: fail(404, 'Asset not found.')
@@ -447,6 +456,7 @@ init_v14_2_1()
 HOMETASK_COMMISSION_BPS = 1000  # 10% deducted from worker's agreed offer
 HOMETASK_CUSTOMER_FEE_BPS = 500  # 5% added to the customer's agreed task price
 def payment_mode():
+    if os.getenv('HOMETASK_DEMO_MODE') == '1': return 'demo_unfunded'
     key=os.getenv('HOMETASK_STRIPE_TEST_SECRET','').strip()
     webhook=os.getenv('HOMETASK_STRIPE_WEBHOOK_SECRET','').strip()
     if key or webhook:
@@ -1167,6 +1177,16 @@ def sync_appointment(c,job_id):
 
 @app.get('/')
 def index(): return FileResponse(HERE/'index.html')
+
+@app.get('/api/map-config')
+def map_config():
+    # Google Maps JavaScript browser API keys are publicly visible by design.
+    # Restrict the key to allowed HTTP referrers and Maps JavaScript API in Cloud Console.
+    return {'google_maps_api_key': os.getenv('HOMETASK_GOOGLE_MAPS_API_KEY', '').strip()}
+
+@app.get('/api/demo/status')
+def demo_status():
+    return {'demo': os.getenv('HOMETASK_DEMO_MODE') == '1'}
 
 @app.get('/api/me')
 def me(req:Request):
